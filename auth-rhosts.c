@@ -54,16 +54,16 @@ extern int use_privsep;
 static int
 check_rhosts_file(const char *filename, const char *hostname,
 		  const char *ipaddr, const char *client_user,
-		  const char *server_user)
+		  const char *server_user, uid_t uid)
 {
 	FILE *f;
-#define RBUFLN 1024
-	char buf[RBUFLN];/* Must not be larger than host, user, dummy below. */
+	char *line = NULL;
+	size_t linesize = 0;
 	int fd;
 	struct stat st;
 
 	/* Open the .rhosts file, deny if unreadable */
-	if ((fd = open(filename, O_RDONLY|O_NONBLOCK)) == -1)
+	if ((fd = open(filename, O_RDONLY|O_NOFOLLOW|O_NONBLOCK)) == -1)
 		return 0;
 	if (fstat(fd, &st) == -1) {
 		close(fd);
@@ -75,21 +75,36 @@ check_rhosts_file(const char *filename, const char *hostname,
 		close(fd);
 		return 0;
 	}
+	/*
+	 * Make sure that the file is either owned by the user or by
+	 * root, and make sure it is not writable by anyone but the
+	 * owner.  This is to help avoid novices accidentally
+	 * allowing access to their account by anyone.
+	 */
+	if (options.strict_modes &&
+	    ((st.st_uid != 0 && st.st_uid != uid) ||
+	    (st.st_mode & 022) != 0)) {
+		logit("Rhosts authentication refused for %.100s: bad modes for %.200s",
+		    server_user, filename);
+		auth_debug_add("Bad file modes for %.200s", filename);
+		return 0;
+	}
 	unset_nonblock(fd);
 	if ((f = fdopen(fd, "r")) == NULL) {
 		close(fd);
 		return 0;
 	}
-	while (fgets(buf, sizeof(buf), f)) {
+	while (getline(&line, &linesize, f) != -1) {
 		/* All three must have length >= buf to avoid overflows. */
-		char hostbuf[RBUFLN], userbuf[RBUFLN], dummy[RBUFLN];
-		char *host, *user, *cp;
-		int negated;
+		const char *host, *user, empty = '\0';
+		char *cp;
+		int i, negated;
 
-		for (cp = buf; *cp == ' ' || *cp == '\t'; cp++)
+		for (cp = line; *cp == ' ' || *cp == '\t'; cp++)
 			;
 		if (*cp == '#' || *cp == '\n' || !*cp)
 			continue;
+		line[strcspn(line, "\r\n")] = '\0';
 
 		/*
 		 * NO_PLUS is supported at least on OSF/1.  We skip it (we
@@ -98,32 +113,30 @@ check_rhosts_file(const char *filename, const char *hostname,
 		if (strncmp(cp, "NO_PLUS", 7) == 0)
 			continue;
 
-		/*
-		 * This should be safe because each buffer is as big as the
-		 * whole string, and thus cannot be overwritten.
-		 */
-		switch (sscanf(buf, "%1023s %1023s %1023s", hostbuf, userbuf,
-		    dummy)) {
+		host = user = &empty;
+		for (i = 0, cp = strtok(cp, " "); cp != NULL;
+		    cp = strtok(NULL, " "), i++) {
+			if (i == 0)
+				host = cp;
+			else if (i == 1)
+				user = cp;
+		}
+		switch (i) {
 		case 0:
 			auth_debug_add("Found empty line in %.100s.", filename);
 			continue;
 		case 1:
 			/* Host name only. */
-			strlcpy(userbuf, server_user, sizeof(userbuf));
+			user = server_user;
 			break;
 		case 2:
 			/* Got both host and user name. */
 			break;
-		case 3:
-			auth_debug_add("Found garbage in %.100s.", filename);
-			continue;
 		default:
-			/* Weird... */
+			auth_debug_add("Found garbage in %.100s.", filename);
 			continue;
 		}
 
-		host = hostbuf;
-		user = userbuf;
 		negated = 0;
 
 		/* Process negated host names, or positive netgroups. */
@@ -164,6 +177,7 @@ check_rhosts_file(const char *filename, const char *hostname,
 
 		/* Found the user and host. */
 		fclose(f);
+		free(line);
 
 		/* If the entry was negated, deny access. */
 		if (negated) {
@@ -177,6 +191,7 @@ check_rhosts_file(const char *filename, const char *hostname,
 
 	/* Authentication using this file denied. */
 	fclose(f);
+	free(line);
 	return 0;
 }
 
@@ -189,8 +204,9 @@ int
 auth_rhosts2(struct passwd *pw, const char *client_user, const char *hostname,
     const char *ipaddr)
 {
-	char buf[1024];
+	char buf[PATH_MAX];
 	struct stat st;
+	int len;
 	static const char *rhosts_files[] = {".shosts", ".rhosts", NULL};
 	u_int rhosts_file_index;
 
@@ -208,8 +224,10 @@ auth_rhosts2(struct passwd *pw, const char *client_user, const char *hostname,
 	for (rhosts_file_index = 0; rhosts_files[rhosts_file_index];
 	    rhosts_file_index++) {
 		/* Check users .rhosts or .shosts. */
-		snprintf(buf, sizeof buf, "%.500s/%.100s",
+		len = snprintf(buf, sizeof buf, "%s/%s",
 			 pw->pw_dir, rhosts_files[rhosts_file_index]);
+		if (len < 0 || (size_t)len >= sizeof buf)
+			continue;
 		if (stat(buf, &st) >= 0)
 			break;
 	}
@@ -217,7 +235,7 @@ auth_rhosts2(struct passwd *pw, const char *client_user, const char *hostname,
 	restore_uid();
 
 	/*
-	 * Deny if The user has no .shosts or .rhosts file and there
+	 * Deny if the user has no .shosts or .rhosts file and there
 	 * are no system-wide files.
 	 */
 	if (!rhosts_files[rhosts_file_index] &&
@@ -235,13 +253,13 @@ auth_rhosts2(struct passwd *pw, const char *client_user, const char *hostname,
 		debug3_f("root user, ignoring system hosts files");
 	else {
 		if (check_rhosts_file(_PATH_RHOSTS_EQUIV, hostname, ipaddr,
-		    client_user, pw->pw_name)) {
+		    client_user, pw->pw_name, pw->pw_uid)) {
 			auth_debug_add("Accepted for %.100s [%.100s] by "
 			    "/etc/hosts.equiv.", hostname, ipaddr);
 			return 1;
 		}
 		if (check_rhosts_file(_PATH_SSH_HOSTS_EQUIV, hostname, ipaddr,
-		    client_user, pw->pw_name)) {
+		    client_user, pw->pw_name, pw->pw_uid)) {
 			auth_debug_add("Accepted for %.100s [%.100s] by "
 			    "%.100s.", hostname, ipaddr, _PATH_SSH_HOSTS_EQUIV);
 			return 1;
@@ -275,25 +293,11 @@ auth_rhosts2(struct passwd *pw, const char *client_user, const char *hostname,
 	for (rhosts_file_index = 0; rhosts_files[rhosts_file_index];
 	    rhosts_file_index++) {
 		/* Check users .rhosts or .shosts. */
-		snprintf(buf, sizeof buf, "%.500s/%.100s",
+		len = snprintf(buf, sizeof buf, "%s/%s",
 			 pw->pw_dir, rhosts_files[rhosts_file_index]);
-		if (stat(buf, &st) == -1)
+		if (len < 0 || (size_t)len >= sizeof buf)
 			continue;
 
-		/*
-		 * Make sure that the file is either owned by the user or by
-		 * root, and make sure it is not writable by anyone but the
-		 * owner.  This is to help avoid novices accidentally
-		 * allowing access to their account by anyone.
-		 */
-		if (options.strict_modes &&
-		    ((st.st_uid != 0 && st.st_uid != pw->pw_uid) ||
-		    (st.st_mode & 022) != 0)) {
-			logit("Rhosts authentication refused for %.100s: bad modes for %.200s",
-			    pw->pw_name, buf);
-			auth_debug_add("Bad file modes for %.200s", buf);
-			continue;
-		}
 		/*
 		 * Check if we have been configured to ignore .rhosts
 		 * and .shosts files.
@@ -307,7 +311,7 @@ auth_rhosts2(struct passwd *pw, const char *client_user, const char *hostname,
 		}
 		/* Check if authentication is permitted by the file. */
 		if (check_rhosts_file(buf, hostname, ipaddr,
-		    client_user, pw->pw_name)) {
+		    client_user, pw->pw_name, pw->pw_uid)) {
 			auth_debug_add("Accepted by %.100s.",
 			    rhosts_files[rhosts_file_index]);
 			/* Restore the privileged uid. */
